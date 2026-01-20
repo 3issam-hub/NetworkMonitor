@@ -1,0 +1,843 @@
+#!/bin/bash
+
+################################################################################
+# Network Traffic Monitor Script
+# Description: Monitors network interface traffic and generates HTML reports
+#              with Gnuplot visualizations
+# Author: Network Monitor Project
+# Usage: ./network_monitor.sh [OPTIONS]
+################################################################################
+
+# Default configuration
+INTERFACE=""
+INTERVAL=60  # Monitoring interval in seconds (default: 1 minute)
+OUTPUT_DIR="/tmp"
+MAX_DURATION=3600  # Maximum monitoring duration in seconds (1 hour)
+USE_ZENITY=0
+EXPORT_CSV=0
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+print_usage() {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+Options:
+    -i, --interface IFACE    Network interface to monitor (required)
+    -t, --interval SECONDS   Monitoring interval (default: 60 seconds)
+    -o, --output DIR         Output directory (default: /tmp)
+    -d, --duration SECONDS   Maximum monitoring duration (default: 3600)
+    -z, --zenity             Use Zenity GUI for configuration
+    -c, --csv                Export data to CSV file
+    -h, --help               Display this help message
+
+Examples:
+    $0 -i eth0
+    $0 -i wlan0 -t 30 -d 7200
+    $0 -i eth0 -o /var/www/html -c
+    $0 -z
+
+EOF
+}
+
+log_message() {
+    local level=$1
+    local message=$2
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo -e "${timestamp} [${level}] ${message}"
+}
+
+check_dependencies() {
+    local deps=("gnuplot")
+    local missing=()
+    
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing+=("$dep")
+        fi
+    done
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${RED}Error: Missing dependencies: ${missing[*]}${NC}"
+        echo "Please install: sudo apt-get install ${missing[*]}"
+        exit 1
+    fi
+}
+
+get_available_interfaces() {
+    ls /sys/class/net/ 2>/dev/null | grep -v "lo"
+}
+
+validate_interface() {
+    local iface=$1
+    if [ ! -d "/sys/class/net/$iface" ]; then
+        echo -e "${RED}Error: Interface '$iface' does not exist${NC}"
+        echo "Available interfaces:"
+        get_available_interfaces
+        exit 1
+    fi
+}
+
+zenity_config() {
+    if ! command -v zenity &> /dev/null; then
+        echo -e "${YELLOW}Warning: Zenity not installed. Using defaults.${NC}"
+        return 1
+    fi
+    
+    # Select interface
+    local interfaces=$(get_available_interfaces | tr '\n' '|')
+    INTERFACE=$(zenity --list --title="Network Monitor" \
+        --text="Select network interface to monitor:" \
+        --column="Interface" ${interfaces%|} 2>/dev/null)
+    
+    if [ -z "$INTERFACE" ]; then
+        echo -e "${RED}No interface selected. Exiting.${NC}"
+        exit 1
+    fi
+    
+    # Get monitoring interval
+    INTERVAL=$(zenity --entry --title="Monitoring Interval" \
+        --text="Enter monitoring interval (seconds):" \
+        --entry-text="60" 2>/dev/null)
+    
+    # Get output directory
+    OUTPUT_DIR=$(zenity --file-selection --directory \
+        --title="Select output directory" \
+        --filename="/tmp/" 2>/dev/null)
+    
+    # Ask about CSV export
+    if zenity --question --title="CSV Export" \
+        --text="Do you want to export data to CSV?" 2>/dev/null; then
+        EXPORT_CSV=1
+    fi
+    
+    return 0
+}
+
+get_network_stats() {
+    local iface=$1
+    local rx_bytes=$(cat /sys/class/net/$iface/statistics/rx_bytes 2>/dev/null || echo 0)
+    local tx_bytes=$(cat /sys/class/net/$iface/statistics/tx_bytes 2>/dev/null || echo 0)
+    
+    echo "$rx_bytes $tx_bytes"
+}
+create_gnuplot_script() {
+    local datafile=$1
+    local output=$2
+    local iface=$3
+    
+    cat > "${output}.gp" << EOF
+set terminal png size 1200,600
+set output '$output'
+set title 'Network Traffic Monitor - $iface' font ",14"
+set xlabel 'Time (minutes ago)' font ",12"
+set ylabel 'Traffic (KB/min)' font ",12"
+set grid
+set key outside right top
+
+set datafile separator ','
+set xdata time
+set timefmt "%s"
+set format x "%M:%S"
+
+plot '$datafile' using 1:(\$2/1024) with lines lw 2 title 'Received (RX)' lt rgb "blue", \\
+     '$datafile' using 1:(\$3/1024) with lines lw 2 title 'Sent (TX)' lt rgb "red"
+EOF
+}
+
+create_html_page() {
+    local outdir=$1
+    local iface=$2
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    cat > "$outdir/index.html" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="60">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Network Traffic Monitor - __INTERFACE__</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a;
+            min-height: 100vh;
+            padding: 20px;
+            color: #e2e8f0;
+        }
+        
+        .animated-bg {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #334155 100%);
+            animation: gradientShift 15s ease infinite;
+        }
+        
+        @keyframes gradientShift {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+        
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            animation: fadeIn 0.6s ease-out;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        header {
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #d946ef 100%);
+            border-radius: 20px;
+            padding: 40px;
+            margin-bottom: 30px;
+            box-shadow: 0 20px 60px rgba(99, 102, 241, 0.3);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        header::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+            animation: pulse 8s ease-in-out infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 0.5; }
+            50% { transform: scale(1.1); opacity: 0.8; }
+        }
+        
+        header h1 {
+            font-size: 3em;
+            margin-bottom: 15px;
+            position: relative;
+            z-index: 1;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            font-weight: 800;
+        }
+        
+        .header-info {
+            position: relative;
+            z-index: 1;
+            font-size: 1.2em;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 20px;
+            border-radius: 25px;
+            background: rgba(16, 185, 129, 0.2);
+            border: 2px solid #10b981;
+            font-weight: 600;
+            animation: statusPulse 2s ease-in-out infinite;
+        }
+        
+        @keyframes statusPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+            50% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+        }
+        
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #10b981;
+            animation: blink 2s ease-in-out infinite;
+        }
+        
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .metric-card {
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            border-radius: 16px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .metric-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 4px;
+            background: linear-gradient(90deg, #6366f1, #8b5cf6, #d946ef);
+        }
+        
+        .metric-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(99, 102, 241, 0.4);
+            border-color: rgba(99, 102, 241, 0.5);
+        }
+        
+        .metric-icon {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            filter: drop-shadow(0 0 10px rgba(99, 102, 241, 0.5));
+        }
+        
+        .metric-label {
+            color: #94a3b8;
+            font-size: 0.9em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+        
+        .metric-value {
+            font-size: 2em;
+            font-weight: 800;
+            background: linear-gradient(135deg, #6366f1, #d946ef);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .graph-section {
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            border-radius: 20px;
+            padding: 40px;
+            margin-bottom: 30px;
+            box-shadow: 0 15px 50px rgba(0,0,0,0.4);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+        }
+        
+        .section-title {
+            font-size: 2em;
+            margin-bottom: 25px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .section-title::before {
+            content: '';
+            width: 6px;
+            height: 40px;
+            background: linear-gradient(180deg, #6366f1, #d946ef);
+            border-radius: 3px;
+        }
+        
+        .graph-wrapper {
+            background: #0f172a;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: inset 0 2px 10px rgba(0,0,0,0.3);
+        }
+        
+        .graph-wrapper img {
+            width: 100%;
+            height: auto;
+            border-radius: 8px;
+            display: block;
+        }
+        
+        .stats-section {
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            border-radius: 20px;
+            padding: 40px;
+            margin-bottom: 30px;
+            box-shadow: 0 15px 50px rgba(0,0,0,0.4);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+        }
+        
+        .stats-table-wrapper {
+            overflow-x: auto;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            background: #0f172a;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        
+        thead {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+        }
+        
+        th {
+            padding: 18px;
+            text-align: left;
+            font-weight: 700;
+            font-size: 0.95em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: white;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.2);
+        }
+        
+        td {
+            padding: 18px;
+            border-bottom: 1px solid rgba(99, 102, 241, 0.1);
+            transition: background 0.3s ease;
+        }
+        
+        tbody tr:hover {
+            background: rgba(99, 102, 241, 0.1);
+        }
+        
+        tbody tr:last-child td {
+            border-bottom: none;
+        }
+        
+        .stat-value {
+            font-weight: 700;
+            color: #a5b4fc;
+            font-size: 1.1em;
+        }
+        
+        .action-section {
+            text-align: center;
+            padding: 30px;
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            border-radius: 20px;
+            margin-bottom: 30px;
+            box-shadow: 0 15px 50px rgba(0,0,0,0.4);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+        }
+        
+        .download-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            padding: 16px 35px;
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: white;
+            text-decoration: none;
+            border-radius: 50px;
+            font-weight: 700;
+            font-size: 1.1em;
+            transition: all 0.3s ease;
+            box-shadow: 0 10px 25px rgba(99, 102, 241, 0.4);
+            border: 2px solid transparent;
+        }
+        
+        .download-btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 15px 35px rgba(99, 102, 241, 0.6);
+            background: linear-gradient(135deg, #8b5cf6, #d946ef);
+        }
+        
+        .download-btn:active {
+            transform: translateY(-1px);
+        }
+        
+        footer {
+            text-align: center;
+            padding: 30px;
+            color: #64748b;
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            border-radius: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            border: 1px solid rgba(99, 102, 241, 0.1);
+        }
+        
+        footer p {
+            margin: 8px 0;
+            font-size: 0.95em;
+        }
+        
+        .footer-highlight {
+            color: #a5b4fc;
+            font-weight: 600;
+        }
+        
+        /* Progress bar animation */
+        .progress-bar {
+            height: 3px;
+            background: rgba(99, 102, 241, 0.2);
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 1000;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #6366f1, #8b5cf6, #d946ef);
+            width: 0%;
+            animation: progressAnimation 60s linear infinite;
+        }
+        
+        @keyframes progressAnimation {
+            0% { width: 0%; }
+            100% { width: 100%; }
+        }
+        
+        
+        @media (max-width: 768px) {
+            header h1 { font-size: 2em; }
+            .section-title { font-size: 1.5em; }
+            .metric-value { font-size: 1.5em; }
+            .metrics-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="animated-bg"></div>
+    <div class="progress-bar"><div class="progress-fill"></div></div>
+    
+    <div class="container">
+        <header>
+            <h1>🌐 Network Traffic Monitor</h1>
+            <div class="header-info">
+                <span style="font-size: 1.3em;">Interface: <strong>__INTERFACE__</strong></span>
+                <span class="status-badge">
+                    <span class="status-dot"></span>
+                    MONITORING ACTIVE
+                </span>
+            </div>
+        </header>
+        
+        <div class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-icon">⏱️</div>
+                <div class="metric-label">Monitoring Interval</div>
+                <div class="metric-value">__INTERVAL__s</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-icon">🔄</div>
+                <div class="metric-label">Last Update</div>
+                <div class="metric-value" id="lastUpdate" style="font-size: 1.2em;">__TIMESTAMP__</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-icon">📈</div>
+                <div class="metric-label">Max Duration</div>
+                <div class="metric-value">__DURATION__m</div>
+            </div>
+            
+            <div class="metric-card">
+                <div class="metric-icon">💾</div>
+                <div class="metric-label">Data Points</div>
+                <div class="metric-value" id="dataPoints">__DATAPOINTS__</div>
+            </div>
+        </div>
+        
+        <div class="graph-section">
+            <h2 class="section-title">Traffic Analysis Over Time</h2>
+            <div class="graph-wrapper">
+                <img src="traffic_graph.png" alt="Network Traffic Graph" id="trafficGraph">
+            </div>
+        </div>
+        
+        <div class="stats-section">
+            <h2 class="section-title">Network Interface Statistics</h2>
+            <div class="stats-table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>📊 Metric</th>
+                            <th>📥 Received (RX)</th>
+                            <th>📤 Transmitted (TX)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Total Bytes</strong></td>
+                            <td class="stat-value">__RX_BYTES__</td>
+                            <td class="stat-value">__TX_BYTES__</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Total Packets</strong></td>
+                            <td class="stat-value">__RX_PACKETS__</td>
+                            <td class="stat-value">__TX_PACKETS__</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Errors</strong></td>
+                            <td class="stat-value">__RX_ERRORS__</td>
+                            <td class="stat-value">__TX_ERRORS__</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Dropped Packets</strong></td>
+                            <td class="stat-value">__RX_DROPPED__</td>
+                            <td class="stat-value">__TX_DROPPED__</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div class="action-section">
+            <a href="traffic_data.csv" class="download-btn" download>
+                <span>📥</span>
+                <span>Download CSV Data</span>
+            </a>
+        </div>
+        
+        <footer>
+            <p><strong>Network Traffic Monitor</strong> | Auto-refresh every 60 seconds</p>
+            <p>Monitoring started: <span class="footer-highlight">__START_TIME__</span></p>
+            <p style="margin-top: 15px; font-size: 0.85em;">Built with Shell Script, Gnuplot & HTML/CSS</p>
+        </footer>
+    </div>
+    
+    <script>
+        setInterval(function() {
+            const now = new Date();
+            document.getElementById('lastUpdate').textContent = 
+                now.toLocaleTimeString();
+        }, 1000);
+        
+        // Add smooth image refresh
+        setInterval(function() {
+            const img = document.getElementById('trafficGraph');
+            img.src = 'traffic_graph.png?' + new Date().getTime();
+        }, 60000);
+        
+        // Animate metric cards on load
+        window.addEventListener('load', function() {
+            const cards = document.querySelectorAll('.metric-card');
+            cards.forEach((card, index) => {
+                setTimeout(() => {
+                    card.style.animation = 'fadeIn 0.5s ease-out';
+                }, index * 100);
+            });
+        });
+    </script>
+</body>
+</html>
+EOF
+    
+    # Replace placeholders
+    local max_duration_min=$((MAX_DURATION / 60))
+    local start_time=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # Get current statistics
+    local rx_bytes=$(cat /sys/class/net/$iface/statistics/rx_bytes 2>/dev/null || echo 0)
+    local tx_bytes=$(cat /sys/class/net/$iface/statistics/tx_bytes 2>/dev/null || echo 0)
+    local rx_packets=$(cat /sys/class/net/$iface/statistics/rx_packets 2>/dev/null || echo 0)
+    local tx_packets=$(cat /sys/class/net/$iface/statistics/tx_packets 2>/dev/null || echo 0)
+    local rx_errors=$(cat /sys/class/net/$iface/statistics/rx_errors 2>/dev/null || echo 0)
+    local tx_errors=$(cat /sys/class/net/$iface/statistics/tx_errors 2>/dev/null || echo 0)
+    local rx_dropped=$(cat /sys/class/net/$iface/statistics/rx_dropped 2>/dev/null || echo 0)
+    local tx_dropped=$(cat /sys/class/net/$iface/statistics/tx_dropped 2>/dev/null || echo 0)
+    
+    # Format bytes to human readable
+    rx_bytes_hr=$(numfmt --to=iec-i --suffix=B $rx_bytes 2>/dev/null || echo "$rx_bytes B")
+    tx_bytes_hr=$(numfmt --to=iec-i --suffix=B $tx_bytes 2>/dev/null || echo "$tx_bytes B")
+    
+    # Count data points
+    local datapoints=0
+    if [ -f "$outdir/traffic_data.csv" ]; then
+        datapoints=$(wc -l < "$outdir/traffic_data.csv")
+    fi
+    
+    sed -i "s|__INTERFACE__|$iface|g" "$outdir/index.html"
+    sed -i "s|__INTERVAL__|$INTERVAL|g" "$outdir/index.html"
+    sed -i "s|__TIMESTAMP__|$timestamp|g" "$outdir/index.html"
+    sed -i "s|__DURATION__|$max_duration_min|g" "$outdir/index.html"
+    sed -i "s|__DATAPOINTS__|$datapoints|g" "$outdir/index.html"
+    sed -i "s|__RX_BYTES__|$rx_bytes_hr|g" "$outdir/index.html"
+    sed -i "s|__TX_BYTES__|$tx_bytes_hr|g" "$outdir/index.html"
+    sed -i "s|__RX_PACKETS__|$rx_packets|g" "$outdir/index.html"
+    sed -i "s|__TX_PACKETS__|$tx_packets|g" "$outdir/index.html"
+    sed -i "s|__RX_ERRORS__|$rx_errors|g" "$outdir/index.html"
+    sed -i "s|__TX_ERRORS__|$tx_errors|g" "$outdir/index.html"
+    sed -i "s|__RX_DROPPED__|$rx_dropped|g" "$outdir/index.html"
+    sed -i "s|__TX_DROPPED__|$tx_dropped|g" "$outdir/index.html"
+    sed -i "s|__START_TIME__|$start_time|g" "$outdir/index.html"
+}
+
+monitor_traffic() {
+    local iface=$INTERFACE
+    local outdir="$OUTPUT_DIR/$iface"
+    local datafile="$outdir/traffic_data.csv"
+    local graphfile="$outdir/traffic_graph.png"
+    
+    # Create output directory
+    mkdir -p "$outdir"
+    
+    # Initialize data file
+    echo "# timestamp,rx_bytes_per_interval,tx_bytes_per_interval" > "$datafile"
+    
+    # Get initial stats
+    local stats=$(get_network_stats $iface)
+    local prev_rx=$(echo $stats | cut -d' ' -f1)
+    local prev_tx=$(echo $stats | cut -d' ' -f2)
+    
+    local start_time=$(date +%s)
+    local iteration=0
+    local max_iterations=$((MAX_DURATION / INTERVAL))
+    
+    log_message "INFO" "Starting monitoring of interface: $iface"
+    log_message "INFO" "Output directory: $outdir"
+    log_message "INFO" "Monitoring interval: $INTERVAL seconds"
+    log_message "INFO" "Maximum duration: $MAX_DURATION seconds ($max_iterations samples)"
+    
+    echo -e "${GREEN}Monitoring started. Press Ctrl+C to stop.${NC}"
+    echo -e "${YELLOW}HTML page: file://$outdir/index.html${NC}"
+    
+    # Trap Ctrl+C
+    trap 'echo -e "\n${YELLOW}Monitoring stopped.${NC}"; exit 0' INT
+    
+    while true; do
+        sleep $INTERVAL
+        
+        # Get current stats
+        stats=$(get_network_stats $iface)
+        local curr_rx=$(echo $stats | cut -d' ' -f1)
+        local curr_tx=$(echo $stats | cut -d' ' -f2)
+        
+        # Calculate bytes per interval
+        local rx_diff=$((curr_rx - prev_rx))
+        local tx_diff=$((curr_tx - prev_tx))
+        
+        # Ensure non-negative values
+        if [ $rx_diff -lt 0 ]; then rx_diff=0; fi
+        if [ $tx_diff -lt 0 ]; then tx_diff=0; fi
+        
+        # Get timestamp
+        local timestamp=$(date +%s)
+        
+        # Append to data file
+        echo "$timestamp,$rx_diff,$tx_diff" >> "$datafile"
+        
+        # Keep only last hour of data
+        local max_lines=$((max_iterations + 1))
+        local current_lines=$(wc -l < "$datafile")
+        if [ $current_lines -gt $max_lines ]; then
+            tail -n $max_lines "$datafile" > "${datafile}.tmp"
+            mv "${datafile}.tmp" "$datafile"
+        fi
+        
+        # Create gnuplot script and generate graph
+        create_gnuplot_script "$datafile" "$graphfile" "$iface"
+        gnuplot "${graphfile}.gp" 2>/dev/null
+        
+        # Update HTML page
+        create_html_page "$outdir" "$iface"
+        
+        # Export to CSV if requested
+        if [ $EXPORT_CSV -eq 1 ]; then
+            cp "$datafile" "$outdir/traffic_data.csv"
+        fi
+        
+        # Update previous values
+        prev_rx=$curr_rx
+        prev_tx=$curr_tx
+        
+        iteration=$((iteration + 1))
+        
+        # Log progress
+        log_message "INFO" "Sample $iteration: RX=${rx_diff}B TX=${tx_diff}B"
+        
+        # Check if max duration reached
+        if [ $iteration -ge $max_iterations ]; then
+            log_message "INFO" "Maximum duration reached. Restarting monitoring..."
+            iteration=0
+        fi
+    done
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -i|--interface)
+            INTERFACE="$2"
+            shift 2
+            ;;
+        -t|--interval)
+            INTERVAL="$2"
+            shift 2
+            ;;
+        -o|--output)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        -d|--duration)
+            MAX_DURATION="$2"
+            shift 2
+            ;;
+        -z|--zenity)
+            USE_ZENITY=1
+            shift
+            ;;
+        -c|--csv)
+            EXPORT_CSV=1
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Unknown option: $1${NC}"
+            print_usage
+            exit 1
+            ;;
+    esac
+done
+
+# Check dependencies
+check_dependencies
+
+# Use Zenity if requested
+if [ $USE_ZENITY -eq 1 ]; then
+    zenity_config
+fi
+
+# Validate interface
+if [ -z "$INTERFACE" ]; then
+    echo -e "${RED}Error: Interface not specified${NC}"
+    print_usage
+    exit 1
+fi
+
+validate_interface "$INTERFACE"
+
+
+monitor_traffic
