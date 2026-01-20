@@ -1,4 +1,4 @@
-![NetworkMonitor-logo](NetM.png)
+<img src="NetM.png" alt="NetworkMonitor-logo" width="30%"/>
 # Network Traffic Monitor - README
 
 ## Project Description
