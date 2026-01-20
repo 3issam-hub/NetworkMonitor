@@ -1,3 +1,4 @@
+![NetworkMonitor-logo](NetM.png)
 # Network Traffic Monitor - README
 
 ## Project Description
