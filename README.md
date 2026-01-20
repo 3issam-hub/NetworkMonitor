@@ -54,7 +54,7 @@ sudo pacman -S gnuplot zenity
 
 1. Download the script:
 ```bash
-wget [script_url]/network_monitor.sh
+git clone https://github.com/3issam-hub/NetworkMonitor.git
 ```
 
 2. Make it executable:
